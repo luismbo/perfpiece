@@ -279,15 +279,18 @@
       (setf (mem-ref handle-ptr :int) +papi-null+)
       (papi-create-eventset handle-ptr)
       (let ((handle (mem-ref handle-ptr :int)))
-        (dolist (event papi-events)
-          ;; TODO: handle errors.
-          (papi-add-event handle (event-code event)))
-        (make-instance 'event-set
-                       :handle handle
-                       :events papi-events
-                       :sw-events (remove-if #'papi-event-p events)
-                       :gc-values (make-counter-array count)
-                       :mutator-values (make-counter-array count))))))
+        (loop for event in papi-events
+              if (ignore-errors (papi-add-event handle (event-code event)))
+              collect event into successful-papi-events
+              else do (warn "Unable to add event ~S" (event-name event))
+              finally (return
+                        (make-instance
+                         'event-set
+                         :handle handle
+                         :events successful-papi-events
+                         :sw-events (remove-if #'papi-event-p events)
+                         :gc-values (make-counter-array count)
+                         :mutator-values (make-counter-array count))))))))
 
 (defun reset-event-set (set)
   (flet ((clear-counter-array (array)
