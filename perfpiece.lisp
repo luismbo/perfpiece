@@ -61,12 +61,13 @@
   (:simple-parser papi-error-code)
   (:actual-type :int))
 
-(defmethod expand-from-foreign (value (type papi-error-code))
-  (with-unique-names (return-code)
-    `(let ((,return-code ,value))
-       (if (minusp ,return-code)
-           (papi-error ,return-code)
-           ,return-code))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defmethod expand-from-foreign (value (type papi-error-code))
+    (with-unique-names (return-code)
+      `(let ((,return-code ,value))
+         (if (minusp ,return-code)
+             (papi-error ,return-code)
+             ,return-code)))))
 
 ;;;; Initialization
 
