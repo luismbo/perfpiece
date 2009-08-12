@@ -417,7 +417,7 @@
 (defun num-hardware-counters ()
   (papi-num-counters))
 
-;;;; Measuring Time
+;;;; Non-PAPI Events
 
 (declaim (inline papi-get-real-nsec papi-get-virt-nsec))
 
@@ -428,11 +428,7 @@
 (define-event :real-time "Real time")
 (define-event :user-time "User time")
 
-;;;; GC runs
-
 (define-event :gc-count "GC count")
-
-;;;; Measuring System Info
 
 (defcstruct timeval
   (sec :long)
@@ -468,15 +464,17 @@
 (defun get-resource-usage ()
   (with-foreign-object (rusage 'rusage)
     (getrusage +rusage-self+ rusage)
-    (with-foreign-slots ((stime majflt nvcsw nivcsw) rusage rusage)
+    (with-foreign-slots ((stime minflt majflt nvcsw nivcsw) rusage rusage)
       (with-foreign-slots ((sec usec) stime timeval)
-        (values (+ (* sec 1000000000) (* usec 1000))
-                majflt nvcsw nivcsw)))))
+        (values (+ (* sec 1000000) usec) minflt majflt nvcsw nivcsw)))))
 
 (define-event :system-time "System time")
+(define-event :page-faults "Page faults")
+(define-event :page-reclaims "Page reclaims")
+(define-event :vcsw "Voluntary context-switches")
+(define-event :ivcsw "Involuntary context-switches")
 
-;;;; Profiling
-
+(define-event :cpu-usage "CPU usage")
 
 ;;;; Interface
 
@@ -504,34 +502,46 @@
 (defun %call-with-measurements (event-set function consumer)
   (check-type function function)
   (with-event-set-slots event-set (handle mutator-values gc-values)
-    (let ((real-nsec-total 0)
-          (tmp-real-nsec-before-gc 0)
-          (real-nsec-gc 0)
-          (user-nsec-total 0)
-          (user-nsec-gc 0)
-          (tmp-user-nsec-before-gc 0)
-          return-values
-          system-nsec-total
-          (system-nsec-gc 0)
-          tmp-system-nsec-before-gc
-          (gc-count 0))
+    (let ((real-nsec-total 0) (real-nsec-gc 0) tmp-real-nsec-before-gc
+          (user-nsec-total 0) (user-nsec-gc 0) tmp-user-nsec-before-gc
+          system-usec-total (system-usec-gc 0) tmp-system-usec-before-gc
+          page-reclaims-total (page-reclaims-gc 0) tmp-page-reclaims-before-gc
+          page-faults-total (page-faults-gc 0) tmp-page-faults-before-gc
+          vcsw-total (vcsw-gc 0) tmp-vcsw-before-gc
+          ivcsw-total (ivcsw-gc 0) tmp-ivcsw-before-gc
+          (gc-count 0)
+          return-values)
       (declare (type (signed-byte #.(* 8 (foreign-type-size :long-long)))
                      real-nsec-total user-nsec-total)
                (dynamic-extent return-values))
-      (setq system-nsec-total (get-resource-usage))
+      (setf (values system-usec-total page-reclaims-total page-faults-total
+                    vcsw-total ivcsw-total)
+            (get-resource-usage))
       (with-instrumented-gc
-          (:before (papi-accum handle mutator-values)
-                   (incf gc-count)
-                   (setq tmp-system-nsec-before-gc (get-resource-usage))
-                   (setq tmp-real-nsec-before-gc (papi-get-real-nsec))
-                   (setq tmp-user-nsec-before-gc (papi-get-virt-nsec)))
-          (:after (papi-accum handle gc-values)
-                  (incf real-nsec-gc
-                        (- (papi-get-real-nsec) tmp-real-nsec-before-gc))
-                  (incf user-nsec-gc
-                        (- (papi-get-virt-nsec) tmp-user-nsec-before-gc))
-                  (incf system-nsec-gc
-                        (- (get-resource-usage) tmp-system-nsec-before-gc)))
+          (:before
+           (papi-accum handle mutator-values)
+           (incf gc-count)
+           (setf (values tmp-system-usec-before-gc
+                         tmp-page-reclaims-before-gc
+                         tmp-page-faults-before-gc
+                         tmp-vcsw-before-gc
+                         tmp-ivcsw-before-gc)
+                 (get-resource-usage))
+           (setq tmp-real-nsec-before-gc (papi-get-real-nsec))
+           (setq tmp-user-nsec-before-gc (papi-get-virt-nsec)))
+          (:after
+           (papi-accum handle gc-values)
+           (incf real-nsec-gc
+                 (- (papi-get-real-nsec) tmp-real-nsec-before-gc))
+           (incf user-nsec-gc
+                 (- (papi-get-virt-nsec) tmp-user-nsec-before-gc))
+           (multiple-value-bind (stime reclaims faults vcsw ivcsw)
+               (get-resource-usage)
+             (incf system-usec-gc (- stime tmp-system-usec-before-gc))
+             (incf page-reclaims-gc (- reclaims tmp-page-reclaims-before-gc))
+             (incf page-faults-gc (- faults tmp-page-faults-before-gc))
+             (incf vcsw-gc (- vcsw tmp-vcsw-before-gc))
+             (incf ivcsw-gc (- ivcsw tmp-ivcsw-before-gc))))
         (locally (declare (optimize (speed 3) (safety 0)))
           (papi-start handle)
           (setq user-nsec-total (papi-get-virt-nsec))
@@ -541,7 +551,13 @@
           (setq user-nsec-total (- (papi-get-virt-nsec) user-nsec-total))
           (papi-accum handle mutator-values)))
       (papi-stop handle (null-pointer))
-      (setq system-nsec-total (- (get-resource-usage) system-nsec-total))
+      (multiple-value-bind (stime reclaims faults vcsw ivcsw)
+          (get-resource-usage)
+        (setq system-usec-total (- stime system-usec-total))
+        (setq page-reclaims-total (- reclaims page-reclaims-total))
+        (setq page-faults-total (- faults page-faults-total))
+        (setq vcsw-total (- vcsw vcsw-total))
+        (setq ivcsw-total (- ivcsw ivcsw-total)))
       ;; Aggregate measurements.
       (let ((hw-event-results
              (loop for event in (events-of event-set) and i from 0 collect
@@ -554,12 +570,32 @@
                (when (member event (sw-events-of event-set) :key #'event-name)
                  (push (list (find-event event) total mutator gc)
                        sw-event-results))))
-          (note :real-time real-nsec-total
-                (- real-nsec-total real-nsec-gc) real-nsec-gc)
-          (note :user-time user-nsec-total
-                (- user-nsec-total user-nsec-gc) user-nsec-gc)
-          (note :system-time system-nsec-total
-                (- system-nsec-total system-nsec-gc) system-nsec-gc)
+          (let ((real-nsec-mutator (- real-nsec-total real-nsec-gc))
+                (user-nsec-mutator (- user-nsec-total user-nsec-gc)))
+            (note :real-time real-nsec-total real-nsec-mutator real-nsec-gc)
+            (note :user-time user-nsec-total user-nsec-mutator user-nsec-gc)
+            (flet ((% (user real)
+                     (cond ((zerop real) -1)
+                           ((>= user real) 100)
+                           (t (* 100 (/ user real))))))
+              (note :cpu-usage
+                    (% user-nsec-total real-nsec-total)
+                    (% user-nsec-mutator real-nsec-mutator)
+                    (% user-nsec-gc real-nsec-gc))))
+          (note :system-time
+                (* 1000 system-usec-total)
+                (* 1000 (- system-usec-total system-usec-gc))
+                (* 1000 system-usec-gc))
+          (note :page-reclaims
+                page-reclaims-total
+                (- page-reclaims-total page-reclaims-gc)
+                page-reclaims-gc)
+          (note :page-faults
+                page-faults-total
+                (- page-faults-total page-faults-gc)
+                page-faults-gc)
+          (note :vcsw vcsw-total (- vcsw-total vcsw-gc) vcsw-gc)
+          (note :ivcsw ivcsw-total (- ivcsw-total ivcsw-gc) ivcsw-gc)
           (note :gc-count gc-count -1 -1))
         (funcall consumer (nconc hw-event-results sw-event-results)))
       ;; Return FUNCTION's return values.
@@ -657,6 +693,8 @@
              ((< n 1000000) (format nil "~,2F us" (/ n 1000)))
              ((< n 1000000000) (format nil "~,2F ms" (/ n 1000000)))
              (t (format nil "~,3F s" (/ n 1000000000)))))
+    ((:cpu-usage)
+       (format nil "~,2F%" n))
     (t
        (cond ((>= n 1000000000) (format nil "~13E" n))
              ((integerp n) (format nil "~:D" n))
