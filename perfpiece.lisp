@@ -189,6 +189,7 @@
                         :name ,name
                         :short-description ,description
                         :description ,description
+                        :available t
                         :native nil
                         :papi nil)))
 
@@ -212,7 +213,16 @@
 (defun find-event-or-lose (name)
   (or (find-event name) (perfpiece-error "no such event ~S" name)))
 
+(defun default-events ()
+  (nconc (delete-if (lambda (x) (papi-event-p (find-event x)))
+                    (list-available-event-names))
+         (list :papi-tot-cyc :papi-tot-ins :papi-l2-dcm :papi-l2-icm)))
+
 ;;;; Event Sets
+
+;;; TODO: add multiplexing. We can support it by (1) using PAPI's
+;;; multiplexing API or (2) doing it ourselves with the SAMPLE
+;;; function.
 
 (declaim (inline papi-start papi-stop papi-accum papi-write))
 
@@ -587,7 +597,7 @@
         (pop results))
       (munge-sample-results events results))))
 
-(defun sample (events function &key (samples 10) (report :table)
+(defun sample (function &key (events (default-events)) (samples 10) (report :table)
                (discard-first t))
   (let ((results (%sample events function samples discard-first)))
     (ecase report
@@ -636,7 +646,7 @@
 
 (defun format-number (event-name n)
   (when (eql n -1)
-    (return-from format-number ""))
+    (return-from format-number "-"))
   (case event-name
     ((:time :real-time :user-time :system-time)
        (cond ((zerop n) "0")
@@ -688,22 +698,22 @@
 
 (defun report-ascertainableness (results)
   (format t "~2&")
-  (let ((widths '(30 13 13 13)))
+  (let ((widths '(34 13 13 13)))
     (print-table-line widths '("" "non-GC" "GC" "Total")
                       :pad-first-column nil)
     (print-horizontal-separator widths)
     (dolist (result results)
       (destructuring-bind (event total mutator gc) result
         (print-table-line
-         widths (cons (concatenate 'string
-                                   (event-description-or-name event 30) ":")
-                      (mapcar (lambda (x) (format-number (event-name event) x))
-                              (list mutator gc total)))
+         widths
+         (cons (concatenate 'string
+                            (event-description-or-name event (1- (car widths))) ":")
+               (mapcar (lambda (x) (format-number (event-name event) x))
+                       (list mutator gc total)))
          :align-first-column :right
          :pad-first-column nil))))
   (terpri))
 
-(defmacro ascertain (form &key (events '(:papi-tot-cyc :real-time
-                                         :user-time :system-time)))
+(defmacro ascertain (form &key (events '(default-events)))
   `(call-with-measurements
     ,events (lambda () ,form) #'report-ascertainableness))
