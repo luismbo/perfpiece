@@ -1,10 +1,11 @@
 ;;;; -*- coding: utf-8; indent-tabs-mode: nil -*-
 
 (defpackage #:perfpiece
-    (:use #:cl #:cffi)
+  (:use #:cl #:cffi)
   (:import-from #:alexandria
                 #:make-keyword #:switch #:when-let #:with-unique-names
                 #:symbolicate #:mean #:standard-deviation #:once-only))
+
 (in-package #:perfpiece)
 
 ;;;; Errors
@@ -71,6 +72,10 @@
 
 ;;;; Initialization
 
+;;; For some reason, PAPI really only likes to be loaded once.
+(unless (foreign-symbol-pointer "PAPI_num_counters")
+  (load-foreign-library '(:or "libpapi.so.3" "libpapi.so")))
+
 (defconstant +papi-not-inited+ 0)
 
 (defcfun "PAPI_is_initialized" :int)
@@ -136,11 +141,11 @@
         nil
         string)))
 
-(defconstant +first-native-event-code+ #x40000000)
-(defconstant +first-preset-event-code+ #x80000000)
+(defconstant +papi-native-mask+ #x40000000)
+(defconstant +papi-preset-mask+ #x80000000)
 
 (defun native-code-p (code)
-  (<= +first-native-event-code+ code (1- +first-preset-event-code+)))
+  (<= +papi-native-mask+ code (1- +papi-preset-mask+)))
 
 (defun papi-code-to-event (code info)
   (when (zerop (papi-get-event-info code info))
@@ -168,20 +173,29 @@
   (event-code (:pointer :uint))
   (modifier :int))
 
-(defun push-events-to-hash-table (info first-event-code hash-table)
-  (with-foreign-object (code :uint)
-    (setf (mem-ref code :uint) first-event-code)
-    (loop for event = (papi-code-to-event (mem-ref code :uint) info)
-          do (setf (gethash (event-name event) hash-table) event)
-          while (zerop (papi-enum-event code 0)))))
+(defconstant +papi-enum-event+ 0)
+(defconstant +papi-enum-first+ 1)
+(defconstant +papi-preset-enum-avail+ 2)
 
-(defun push-all-events-to-hash-table (hash-table)
+(defun papi-events-to-hash-table ()
   (initialize-papi-if-necessary)
-  (with-foreign-object (info 'event-info)
-    (push-events-to-hash-table info +first-preset-event-code+ hash-table)
-    (push-events-to-hash-table info +first-native-event-code+ hash-table)))
+  (with-foreign-objects ((info 'event-info)
+                         (code :uint))
+    (let ((hash-table (make-hash-table)))
+      (flet ((push-events (mask enumerator)
+               (setf (mem-ref code :uint) mask)
+               (papi-enum-event code +papi-enum-first+)
+               (loop for event = (papi-code-to-event (mem-ref code :uint) info)
+                     do (setf (gethash (event-name event) hash-table) event)
+                     while (ignore-errors
+                             ;; Sometimes PAPI-ENUM-EVENT signals
+                             ;; PAPI-EBUG, not sure why...
+                             (zerop (papi-enum-event code enumerator))))))
+        (push-events +papi-preset-mask+ +papi-preset-enum-avail+)
+        (push-events +papi-native-mask+ +papi-enum-event+))
+      hash-table)))
 
-(defvar *events* (make-hash-table))
+(defvar *events* (papi-events-to-hash-table))
 
 (defmacro define-event (name description)
   `(setf (gethash ,name *events*)
@@ -192,11 +206,6 @@
                         :available t
                         :native nil
                         :papi nil)))
-
-;;; For some reason, PAPI really only likes to be loaded once.
-(when (zerop (hash-table-count *events*))
-  (load-foreign-library '(:or "libpapi.so.3" "libpapi.so"))
-  (push-all-events-to-hash-table *events*))
 
 (defun list-event-names ()
   (loop for event being the hash-keys of *events* collect event))
