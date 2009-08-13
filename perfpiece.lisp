@@ -510,6 +510,7 @@
           vcsw-total (vcsw-gc 0) tmp-vcsw-before-gc
           ivcsw-total (ivcsw-gc 0) tmp-ivcsw-before-gc
           (gc-count 0)
+          (empty-papi-set-p (zerop (length (events-of event-set))))
           return-values)
       (declare (type (signed-byte #.(* 8 (foreign-type-size :long-long)))
                      real-nsec-total user-nsec-total)
@@ -519,7 +520,8 @@
             (get-resource-usage))
       (with-instrumented-gc
           (:before
-           (papi-accum handle mutator-values)
+           (unless empty-papi-set-p
+             (papi-accum handle mutator-values))
            (incf gc-count)
            (setf (values tmp-system-usec-before-gc
                          tmp-page-reclaims-before-gc
@@ -530,7 +532,8 @@
            (setq tmp-real-nsec-before-gc (papi-get-real-nsec))
            (setq tmp-user-nsec-before-gc (papi-get-virt-nsec)))
           (:after
-           (papi-accum handle gc-values)
+           (unless empty-papi-set-p
+             (papi-accum handle gc-values))
            (incf real-nsec-gc
                  (- (papi-get-real-nsec) tmp-real-nsec-before-gc))
            (incf user-nsec-gc
@@ -543,14 +546,15 @@
              (incf vcsw-gc (- vcsw tmp-vcsw-before-gc))
              (incf ivcsw-gc (- ivcsw tmp-ivcsw-before-gc))))
         (locally (declare (optimize (speed 3) (safety 0)))
-          (papi-start handle)
+          (unless empty-papi-set-p
+            (papi-start handle))
           (setq user-nsec-total (papi-get-virt-nsec))
           (setq real-nsec-total (papi-get-real-nsec))
           (setq return-values (multiple-value-list (funcall function)))
           (setq real-nsec-total (- (papi-get-real-nsec) real-nsec-total))
           (setq user-nsec-total (- (papi-get-virt-nsec) user-nsec-total))
-          (papi-accum handle mutator-values)))
-      (papi-stop handle (null-pointer))
+          (unless empty-papi-set-p
+            (papi-accum handle mutator-values))))
       (multiple-value-bind (stime reclaims faults vcsw ivcsw)
           (get-resource-usage)
         (setq system-usec-total (- stime system-usec-total))
@@ -558,6 +562,8 @@
         (setq page-faults-total (- faults page-faults-total))
         (setq vcsw-total (- vcsw vcsw-total))
         (setq ivcsw-total (- ivcsw ivcsw-total)))
+      (unless empty-papi-set-p
+        (papi-stop handle (null-pointer)))
       ;; Aggregate measurements.
       (let ((hw-event-results
              (loop for event in (events-of event-set) and i from 0 collect
