@@ -644,6 +644,7 @@
 
 (defun sample (function &key (events (default-events)) (samples 10) (report :table)
                (discard-first t))
+  (check-type samples (integer 1))
   (let ((results (%sample events function samples discard-first)))
     (ecase report
       (:table (report-results-as-table results) (values))
