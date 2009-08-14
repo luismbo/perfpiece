@@ -372,6 +372,58 @@
      (unwind-protect (progn ,@body)
        (destroy-event-set ,name-arg))))
 
+(defconstant +papi-domain+ 5)
+
+(defconstant +papi-dom-user+ 1)
+(defconstant +papi-dom-min+ +papi-dom-user+)
+(defconstant +papi-dom-kernel+ 2)
+(defconstant +papi-dom-other+ 4)
+(defconstant +papi-dom-supervisor+ 8)
+(defconstant +papi-dom-all+
+  (logior +papi-dom-user+ +papi-dom-kernel+ +papi-dom-other+
+          +papi-dom-supervisor+))
+
+(defcstruct papi-domain-option
+  (event-set :int)
+  (domain :int))
+
+(defconstant +papi-defgrn+ 6)
+(defconstant +papi-granul+ 7)
+
+(defconstant +papi-grn-thr+ 1)
+(defconstant +papi-grn-min+ +papi-grn-thr+)
+(defconstant +papi-grn-proc+ 2)
+(defconstant +papi-grn-procg+ 4)
+(defconstant +papi-grn-sys+ 8)
+(defconstant +papi-grn-sys-cpu+ #x10) ; (sic)
+(defconstant +papi-grn-max+ +papi-grn-sys-cpu+)
+
+(defcstruct (papi-granularity-option)
+  (event-set :int)
+  (granularity :int))
+
+(defcfun "PAPI_set_opt" papi-error-code
+  (option :int)
+  (ptr :pointer))
+
+(defcfun "PAPI_get_opt" papi-error-code
+  (option :int)
+  (ptr :pointer))
+
+(defun (setf event-set-granularity) (grn set)
+  (with-foreign-object (opt 'papi-granularity-option)
+    (with-foreign-slots ((event-set granularity) opt papi-granularity-option)
+      (setf event-set (handle-of set))
+      (setf granularity grn))
+    (papi-set-opt +papi-granul+ opt)))
+
+(defun event-set-granularity (set)
+  (with-foreign-object (opt 'papi-granularity-option)
+    (with-foreign-slots ((event-set granularity) opt papi-granularity-option)
+      (setf event-set (handle-of set))
+      (papi-get-opt +papi-granul+ opt)
+      granularity)))
+
 ;;;; Querying the Hardware
 
 (defconstant +papi-mh-max-levels+ 4)
