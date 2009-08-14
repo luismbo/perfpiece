@@ -4,7 +4,9 @@
   (:use #:cl #:cffi)
   (:import-from #:alexandria
                 #:make-keyword #:switch #:when-let #:with-unique-names
-                #:symbolicate #:mean #:standard-deviation #:once-only))
+                #:symbolicate #:mean #:standard-deviation #:once-only
+                #:ignore-some-conditions)
+  (:export #:ascertain #:sample #:perfpiece-error))
 
 (in-package #:perfpiece)
 
@@ -87,10 +89,45 @@
 ;;; the library.
 (defcfun "PAPI_num_counters" papi-error-code)
 
+(defcfun "PAPI_thread_init" papi-error-code
+  (function :pointer))
+
 (defun initialize-papi-if-necessary ()
   (unless (papi-initialized-p)
     (papi-num-counters)
+    #+sb-thread
+    (papi-thread-init (foreign-symbol-pointer "pthread_self"))
     t))
+
+;;;; libppmonitor
+
+(defcstruct monitor-measurements
+  (tid :uint)
+  (real-nsec :llong)
+  (user-nsec :llong)
+  (next :pointer))
+
+(defun libppmonitor-loaded-p ()
+  (let ((ptr (foreign-symbol-pointer "libppmonitor_loaded_p")))
+    (and (not (null ptr)) (mem-ref ptr :boolean))))
+
+(defun activate-thread-monitor ()
+  (setf (mem-ref (foreign-symbol-pointer "perfpiece_active_p") :boolean) t))
+
+(defun free-thread-monitor-results ()
+  (foreign-funcall-pointer
+   (foreign-symbol-pointer "free_perfpiece_measurements") ()))
+
+(defun get-thread-monitor-results ()
+  (setf (mem-ref (foreign-symbol-pointer "perfpiece_active_p") :boolean) nil)
+  (loop for m = (mem-ref (foreign-symbol-pointer "perfpiece_measurements")
+                         :pointer)
+          then (foreign-slot-value m 'monitor-measurements 'next)
+        until (null-pointer-p m)
+        collect (with-foreign-slots ((real-nsec user-nsec)
+                                     m monitor-measurements)
+                  (list :real-time real-nsec :user-time user-nsec))
+        finally (free-thread-monitor-results)))
 
 ;;;; Listing and Querying Events
 
@@ -525,9 +562,18 @@
 (defun get-resource-usage ()
   (with-foreign-object (rusage 'rusage)
     (getrusage +rusage-self+ rusage)
-    (with-foreign-slots ((stime minflt majflt nvcsw nivcsw) rusage rusage)
-      (with-foreign-slots ((sec usec) stime timeval)
-        (values (+ (* sec 1000000) usec) minflt majflt nvcsw nivcsw)))))
+    (with-foreign-slots ((utime stime minflt majflt nvcsw nivcsw) rusage rusage)
+      (values (with-foreign-slots ((sec usec) utime timeval)
+                (+ (* sec 1000000) usec))
+              (with-foreign-slots ((sec usec) stime timeval)
+                (+ (* sec 1000000) usec))
+              minflt
+              majflt
+              nvcsw
+              nivcsw))))
+
+#+#:ignore
+(define-event :process-user-time "Process user time")
 
 (define-event :system-time "System time")
 (define-event :page-faults "Page faults")
@@ -536,6 +582,9 @@
 (define-event :ivcsw "Involuntary context-switches")
 
 (define-event :cpu-usage "CPU usage")
+
+#+#:ignore
+(define-event :process-cpu-usage "Process CPU usage")
 
 ;;;; Interface
 
@@ -561,10 +610,15 @@
          'call-with-instrumented-gc))
 
 (defun %call-with-measurements (event-set function consumer)
-  (check-type function function)
+  (when (libppmonitor-loaded-p)
+    (activate-thread-monitor))
+  #+#:ignore
+  (ignore-some-conditions (papi-esbstr)
+    (setf (event-set-granularity event-set) +papi-grn-proc+))
   (with-event-set-slots event-set (handle mutator-values gc-values)
     (let ((real-nsec-total 0) (real-nsec-gc 0) tmp-real-nsec-before-gc
           (user-nsec-total 0) (user-nsec-gc 0) tmp-user-nsec-before-gc
+          proc-usec-total (proc-usec-gc 0) tmp-proc-usec-before-gc
           system-usec-total (system-usec-gc 0) tmp-system-usec-before-gc
           page-reclaims-total (page-reclaims-gc 0) tmp-page-reclaims-before-gc
           page-faults-total (page-faults-gc 0) tmp-page-faults-before-gc
@@ -576,15 +630,17 @@
       (declare (type (signed-byte #.(* 8 (foreign-type-size :long-long)))
                      real-nsec-total user-nsec-total)
                (dynamic-extent return-values))
-      (setf (values system-usec-total page-reclaims-total page-faults-total
-                    vcsw-total ivcsw-total)
+      (check-type function function)
+      (setf (values proc-usec-total system-usec-total page-reclaims-total
+                    page-faults-total vcsw-total ivcsw-total)
             (get-resource-usage))
       (with-instrumented-gc
           (:before
            (unless empty-papi-set-p
              (papi-accum handle mutator-values))
            (incf gc-count)
-           (setf (values tmp-system-usec-before-gc
+           (setf (values tmp-proc-usec-before-gc
+                         tmp-system-usec-before-gc
                          tmp-page-reclaims-before-gc
                          tmp-page-faults-before-gc
                          tmp-vcsw-before-gc
@@ -599,8 +655,9 @@
                  (- (papi-get-real-nsec) tmp-real-nsec-before-gc))
            (incf user-nsec-gc
                  (- (papi-get-virt-nsec) tmp-user-nsec-before-gc))
-           (multiple-value-bind (stime reclaims faults vcsw ivcsw)
+           (multiple-value-bind (utime stime reclaims faults vcsw ivcsw)
                (get-resource-usage)
+             (incf proc-usec-gc (- utime tmp-proc-usec-before-gc))
              (incf system-usec-gc (- stime tmp-system-usec-before-gc))
              (incf page-reclaims-gc (- reclaims tmp-page-reclaims-before-gc))
              (incf page-faults-gc (- faults tmp-page-faults-before-gc))
@@ -616,8 +673,9 @@
           (setq user-nsec-total (- (papi-get-virt-nsec) user-nsec-total))
           (unless empty-papi-set-p
             (papi-accum handle mutator-values))))
-      (multiple-value-bind (stime reclaims faults vcsw ivcsw)
+      (multiple-value-bind (utime stime reclaims faults vcsw ivcsw)
           (get-resource-usage)
+        (setq proc-usec-total (- utime proc-usec-total))
         (setq system-usec-total (- stime system-usec-total))
         (setq page-reclaims-total (- reclaims page-reclaims-total))
         (setq page-faults-total (- faults page-faults-total))
@@ -626,7 +684,9 @@
       (unless empty-papi-set-p
         (papi-stop handle (null-pointer)))
       ;; Aggregate measurements.
-      (let ((hw-event-results
+      (let ((monitor-results (when (libppmonitor-loaded-p)
+                               (get-thread-monitor-results)))
+            (hw-event-results
              (loop for event in (events-of event-set) and i from 0 collect
                (let ((mutator (mem-aref mutator-values :long-long i))
                      (gc (mem-aref gc-values :long-long i)))
@@ -638,9 +698,14 @@
                  (push (list (find-event event) total mutator gc)
                        sw-event-results))))
           (let ((real-nsec-mutator (- real-nsec-total real-nsec-gc))
-                (user-nsec-mutator (- user-nsec-total user-nsec-gc)))
+                (user-nsec-mutator (- user-nsec-total user-nsec-gc))
+                (proc-usec-mutator (- proc-usec-total proc-usec-gc)))
             (note :real-time real-nsec-total real-nsec-mutator real-nsec-gc)
             (note :user-time user-nsec-total user-nsec-mutator user-nsec-gc)
+            (note :process-user-time
+                  (* 1000 proc-usec-total)
+                  (* 1000 proc-usec-mutator)
+                  (* 1000 proc-usec-gc))
             (flet ((% (user real)
                      (cond ((zerop real) -1)
                            ((>= user real) 100)
@@ -648,7 +713,11 @@
               (note :cpu-usage
                     (% user-nsec-total real-nsec-total)
                     (% user-nsec-mutator real-nsec-mutator)
-                    (% user-nsec-gc real-nsec-gc))))
+                    (% user-nsec-gc real-nsec-gc))
+              (note :process-cpu-usage
+                    (% (* 1000 proc-usec-total) real-nsec-total)
+                    (% (* 1000 proc-usec-mutator) real-nsec-mutator)
+                    (% (* 1000 proc-usec-gc) real-nsec-gc))))
           (note :system-time
                 (* 1000 system-usec-total)
                 (* 1000 (- system-usec-total system-usec-gc))
@@ -664,7 +733,8 @@
           (note :vcsw vcsw-total (- vcsw-total vcsw-gc) vcsw-gc)
           (note :ivcsw ivcsw-total (- ivcsw-total ivcsw-gc) ivcsw-gc)
           (note :gc-count gc-count -1 -1))
-        (funcall consumer (nconc hw-event-results sw-event-results)))
+        (funcall consumer (nconc hw-event-results sw-event-results)
+                 monitor-results))
       ;; Return FUNCTION's return values.
       (apply #'values return-values))))
 
@@ -697,14 +767,16 @@
     (let ((results nil))
       (loop repeat samples
             do (%call-with-measurements
-                set function (lambda (res) (push res results)))
+                set function (lambda (res threads)
+                               (declare (ignore threads))
+                               (push res results)))
             do (reset-event-set set))
       (when discard-first
         (pop results))
       (munge-sample-results events results))))
 
-(defun sample (function &key (events (default-events)) (samples 10) (report :table)
-               (discard-first t))
+(defun sample (function &key (events (default-events)) (samples 10)
+               (report :table) (discard-first t))
   (check-type samples (integer 1))
   (let ((results (%sample events function samples discard-first)))
     (ecase report
@@ -755,13 +827,13 @@
   (when (eql n -1)
     (return-from format-number "-"))
   (case event-name
-    ((:time :real-time :user-time :system-time)
+    ((:time :real-time :user-time :system-time :process-user-time)
        (cond ((zerop n) "0")
              ((< n 1000) (format nil "~D ns" (round n)))
-             ((< n 1000000) (format nil "~,2F us" (/ n 1000)))
+             ((< n 1000000) (format nil "~,2F µs" (/ n 1000)))
              ((< n 1000000000) (format nil "~,2F ms" (/ n 1000000)))
              (t (format nil "~,3F s" (/ n 1000000000)))))
-    ((:cpu-usage)
+    ((:cpu-usage :process-cpu-usage)
        (format nil "~,2F%" n))
     (t
        (cond ((>= n 1000000000) (format nil "~13E" n))
@@ -805,7 +877,7 @@
         (print-data-line name widths "gc-only:" data #'third))
       (terpri))))
 
-(defun report-ascertainableness (results)
+(defun report-ascertainableness (results other-threads)
   (format t "~2&")
   (let ((widths '(34 13 13 13)))
     (print-table-line widths '("" "non-GC" "GC" "Total")
@@ -821,6 +893,18 @@
                        (list mutator gc total)))
          :align-first-column :right
          :pad-first-column nil))))
+  (terpri)
+  ;; tmp
+  (format t "~D new threads were spawned~%" (length other-threads))
+  (loop for i from 0 for res in other-threads
+        for real = (getf res :real-time)
+        for user = (getf res :user-time)
+        for cpu = (cond ((zerop real) -1)
+                        ((>= user real) 100)
+                        (t (* 100 (/ user real))))
+        do (format t "  #~D real: ~A, user: ~A, cpu: ~A~%"
+                   i (format-number :time real) (format-number :time user)
+                   (format-number :cpu-usage cpu)))
   (terpri))
 
 (defmacro ascertain (form &key (events '(default-events)))
