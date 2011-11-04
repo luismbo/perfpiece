@@ -173,7 +173,7 @@
   (info event-info))
 
 (defun cstring (pointer)
-  (let ((string (foreign-string-to-lisp pointer :encoding :ascii :errorp nil)))
+  (let ((string (foreign-string-to-lisp pointer :encoding :iso-8859-1)))
     (if (zerop (length string))
         nil
         string)))
