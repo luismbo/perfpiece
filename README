@@ -1,3 +1,0 @@
-Perfpiece is a tool for measuring the performance of Lisp code, not
-unlike the standard CL:TIME. Among other features, it accesses the
-hardware performance counters through the PAPI library.
