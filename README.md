@@ -34,7 +34,7 @@ Here are its main features:
 
 4. Segregation of measurements between mutator and GC.
 
-5. Support for sampling. Perfpiece can repeat a given a measurement a
+5. Support for sampling. Perfpiece can repeat a given measurement a
    number of times then calculate and report basic statistic analysis:
    minimums, maximums, geometric means, and standard deviations for
    each measured event.
